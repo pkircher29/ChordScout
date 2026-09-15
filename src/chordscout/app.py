@@ -1,4 +1,4 @@
-"""Desktop GUI Application for ChordScout with drag-and-drop, playback, and guitar diagrams."""
+"""ChordScout - Modern Studio Desktop GUI Application for Guitar Chord Recognition."""
 
 from __future__ import annotations
 
@@ -7,26 +7,27 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QThread, QTime, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
-    QBrush,
     QColor,
     QDragEnterEvent,
     QDropEvent,
     QFont,
+    QIcon,
     QKeySequence,
-    QPainter,
-    QPen,
+    QShortcut,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
-    QHeaderView,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QMainWindow,
@@ -36,9 +37,12 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -52,219 +56,15 @@ from chordscout.export import (
     load_project,
     save_project,
 )
-from chordscout.guitar import GUITAR_CHORDS, GuitarChord, get_guitar_chord
+from chordscout.guitar import GUITAR_CHORDS, get_guitar_chord
 from chordscout.models import AnalysisMetadata, AnalysisResult, ChordSegment, format_timestamp
-
-
-# --- Custom Widgets ---
-
-
-class GuitarFretboardWidget(QWidget):
-    """Visual widget displaying guitar chord diagrams (nut, frets, strings, finger dots)."""
-
-    def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self.chord: Optional[GuitarChord] = None
-        self.chord_name: str = "None"
-        self.setMinimumSize(170, 220)
-
-    def set_chord(self, chord_name: str) -> None:
-        self.chord_name = chord_name
-        self.chord = get_guitar_chord(chord_name)
-        self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        w = self.width()
-        h = self.height()
-
-        # Background
-        painter.fillRect(0, 0, w, h, QColor("#1e1e24"))
-
-        # Title / Chord name
-        painter.setPen(QColor("#f0f0f5"))
-        title_font = QFont("Segoe UI", 16, QFont.Weight.Bold)
-        painter.setFont(title_font)
-        painter.drawText(QRectF(0, 8, w, 30), Qt.AlignmentFlag.AlignCenter, self.chord_name)
-
-        if not self.chord or self.chord_name in ("N", "None", ""):
-            info_font = QFont("Segoe UI", 9)
-            painter.setFont(info_font)
-            painter.setPen(QColor("#888899"))
-            text = "No guitar voicing" if self.chord_name == "N" else "Select a chord"
-            painter.drawText(QRectF(0, 50, w, 100), Qt.AlignmentFlag.AlignCenter, text)
-            return
-
-        # Fretboard geometry
-        margin_x = 35
-        margin_y = 55
-        grid_w = w - (margin_x * 2)
-        grid_h = h - margin_y - 25
-        num_frets = 4
-        num_strings = 6
-        dx = grid_w / (num_strings - 1)
-        dy = grid_h / num_frets
-
-        # Base fret indication
-        base_fret = self.chord.base_fret
-        fret_font = QFont("Segoe UI", 9, QFont.Weight.Bold)
-        painter.setFont(fret_font)
-        painter.setPen(QColor("#ffaa44"))
-        if base_fret > 1:
-            painter.drawText(margin_x - 26, int(margin_y + dy * 0.75), f"{base_fret}fr")
-
-        # Nut or normal fret line
-        nut_pen = QPen(QColor("#ffffff" if base_fret == 1 else "#777788"))
-        nut_pen.setWidth(4 if base_fret == 1 else 2)
-        painter.setPen(nut_pen)
-        painter.drawLine(int(margin_x), int(margin_y), int(margin_x + grid_w), int(margin_y))
-
-        # Fret wires (horizontal)
-        fret_pen = QPen(QColor("#555566"), 1.5)
-        painter.setPen(fret_pen)
-        for i in range(1, num_frets + 1):
-            y = margin_y + (i * dy)
-            painter.drawLine(int(margin_x), int(y), int(margin_x + grid_w), int(y))
-
-        # Strings (vertical) - low E to high e
-        for s in range(num_strings):
-            x = margin_x + (s * dx)
-            # Thicker lines for bass strings
-            string_width = 3.0 - (s * 0.35)
-            s_pen = QPen(QColor("#a0a0b5"), max(1.0, string_width))
-            painter.setPen(s_pen)
-            painter.drawLine(int(x), int(margin_y), int(x), int(margin_y + grid_h))
-
-        # Markers (open 'o', muted 'x', and finger dots)
-        for s, fret in enumerate(self.chord.frets):
-            x = margin_x + (s * dx)
-            if fret == -1:
-                # Muted 'x' above nut
-                painter.setPen(QPen(QColor("#ee5555"), 2))
-                painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-                painter.drawText(
-                    QRectF(x - 8, margin_y - 18, 16, 16),
-                    Qt.AlignmentFlag.AlignCenter,
-                    "x",
-                )
-            elif fret == 0:
-                # Open 'o' above nut
-                painter.setPen(QPen(QColor("#44cc66"), 2))
-                painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-                painter.drawText(
-                    QRectF(x - 8, margin_y - 18, 16, 16),
-                    Qt.AlignmentFlag.AlignCenter,
-                    "o",
-                )
-            else:
-                # Fret dot
-                rel_fret = fret - base_fret + 1
-                if 1 <= rel_fret <= num_frets:
-                    dot_y = margin_y + ((rel_fret - 0.5) * dy)
-                    dot_radius = 8.0
-                    painter.setPen(Qt.PenStyle.NoPen)
-                    painter.setBrush(QBrush(QColor("#3399ff")))
-                    painter.drawEllipse(QPointF(x, dot_y), dot_radius, dot_radius)
-
-                    # Finger number inside dot
-                    finger = self.chord.fingers[s] if s < len(self.chord.fingers) else 0
-                    if finger > 0:
-                        painter.setPen(QColor("#ffffff"))
-                        painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-                        painter.drawText(
-                            QRectF(x - 8, dot_y - 8, 16, 16),
-                            Qt.AlignmentFlag.AlignCenter,
-                            str(finger),
-                        )
-
-
-class ChordTimelineWidget(QWidget):
-    """Horizontal chord track timeline showing segments and playback cursor."""
-
-    seek_requested = Signal(float)  # Emits target seconds when user clicks
-
-    def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self.segments: List[ChordSegment] = []
-        self.total_duration: float = 1.0
-        self.current_time: float = 0.0
-        self.setFixedHeight(50)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def set_data(self, segments: List[ChordSegment], duration: float) -> None:
-        self.segments = segments
-        self.total_duration = max(0.1, duration)
-        self.update()
-
-    def set_current_time(self, time_sec: float) -> None:
-        self.current_time = max(0.0, min(time_sec, self.total_duration))
-        self.update()
-
-    def mousePressEvent(self, event) -> None:  # noqa: N802
-        if self.total_duration <= 0 or self.width() <= 0:
-            return
-        frac = event.position().x() / self.width()
-        target_sec = max(0.0, min(self.total_duration, frac * self.total_duration))
-        self.seek_requested.emit(target_sec)
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        w = self.width()
-        h = self.height()
-        painter.fillRect(0, 0, w, h, QColor("#181820"))
-
-        if not self.segments or self.total_duration <= 0:
-            painter.setPen(QColor("#555566"))
-            painter.setFont(QFont("Segoe UI", 10))
-            painter.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, "Timeline will appear here")
-            return
-
-        font = QFont("Segoe UI", 9, QFont.Weight.Bold)
-        painter.setFont(font)
-
-        # Palette for chords
-        palette = [
-            QColor("#2d4059"),
-            QColor("#34495e"),
-            QColor("#16a085"),
-            QColor("#27ae60"),
-            QColor("#2980b9"),
-            QColor("#8e44ad"),
-            QColor("#d35400"),
-            QColor("#c0392b"),
-        ]
-
-        for i, seg in enumerate(self.segments):
-            x1 = (seg.start_time / self.total_duration) * w
-            x2 = (seg.end_time / self.total_duration) * w
-            seg_w = max(1.0, x2 - x1)
-
-            color = QColor("#222228") if seg.chord == "N" else palette[hash(seg.chord) % len(palette)]
-            # Highlight if currently active
-            if seg.start_time <= self.current_time < seg.end_time:
-                color = color.lighter(140)
-
-            painter.fillRect(QRectF(x1, 2, seg_w, h - 4), color)
-            painter.setPen(QColor("#101015"))
-            painter.drawRect(QRectF(x1, 2, seg_w, h - 4))
-
-            # Chord label inside block if wide enough
-            if seg_w > 20:
-                painter.setPen(QColor("#ffffff"))
-                painter.drawText(
-                    QRectF(x1, 2, seg_w, h - 4),
-                    Qt.AlignmentFlag.AlignCenter,
-                    seg.chord,
-                )
-
-        # Playhead cursor
-        cursor_x = (self.current_time / self.total_duration) * w
-        painter.setPen(QPen(QColor("#ffdd44"), 2))
-        painter.drawLine(int(cursor_x), 0, int(cursor_x), h)
+from chordscout.theme import STUDIO_DARK_STYLESHEET
+from chordscout.transposer import transpose_chord_name, transpose_segments
+from chordscout.widgets.chord_grid_view import ChordGridView
+from chordscout.widgets.drop_overlay import DropOverlayWidget
+from chordscout.widgets.fretboard_widget import GuitarFretboardWidget
+from chordscout.widgets.hud_transport import HudTransportWidget
+from chordscout.widgets.waveform_timeline import WaveformTimelineWidget
 
 
 # --- Background Worker Thread ---
@@ -284,7 +84,7 @@ class AnalysisWorker(QThread):
 
     def run(self) -> None:
         try:
-            self.progress_updated.emit(0.02, "Loading audio file...")
+            self.progress_updated.emit(0.04, "Reading & normalizing audio...")
             audio, sr, duration = load_audio(self.file_path)
 
             def cb(p: float, msg: str) -> None:
@@ -317,17 +117,21 @@ class AnalysisWorker(QThread):
 
 
 class ChordScoutApp(QMainWindow):
-    """Main window of the ChordScout application."""
+    """Studio-grade desktop interface for ChordScout."""
 
     def __init__(self, initial_file: Optional[str] = None):
         super().__init__()
-        self.setWindowTitle("ChordScout - Guitar Chord Analyzer")
-        self.resize(980, 680)
+        self.setWindowTitle("ChordScout 🎸 — Guitar Chord Analyzer")
+        self.resize(1120, 780)
+        self.setMinimumSize(880, 600)
         self.setAcceptDrops(True)
 
         self.current_result: Optional[AnalysisResult] = None
+        self.base_segments: List[ChordSegment] = []  # Original untransposed segments
         self.audio_worker: Optional[AnalysisWorker] = None
-        self.audio_data: Optional[object] = None
+        self.audio_data: Optional[np.ndarray] = None
+        self.transposition_semitones: int = 0
+        self.is_looping_chord: bool = False
 
         # Media Player setup
         self.player = QMediaPlayer(self)
@@ -337,91 +141,140 @@ class ChordScoutApp(QMainWindow):
         self.player.playbackStateChanged.connect(self.on_playback_state_changed)
 
         self._setup_ui()
-        self._apply_dark_theme()
+        self.setStyleSheet(STUDIO_DARK_STYLESHEET)
+        self._setup_shortcuts()
 
         if initial_file and os.path.exists(initial_file):
             self.start_analysis(Path(initial_file))
 
+    def _setup_shortcuts(self) -> None:
+        # Spacebar for Play/Pause
+        QShortcut(QKeySequence(Qt.Key.Key_Space), self, self.toggle_playback)
+        # S for Strum current chord
+        QShortcut(QKeySequence(Qt.Key.Key_S), self, self.strum_current_chord)
+        # Ctrl+O for Open file
+        QShortcut(QKeySequence(Qt.Key.Key_O | Qt.KeyboardModifier.ControlModifier), self, self.on_open_file_clicked)
+        # Ctrl+C for Copy
+        QShortcut(QKeySequence(Qt.Key.Key_C | Qt.KeyboardModifier.ControlModifier), self, self.copy_to_clipboard)
+
     def _setup_ui(self) -> None:
-        # Central container
         central = QWidget(self)
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(16, 16, 16, 16)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(16, 14, 16, 14)
+        main_layout.setSpacing(10)
 
-        # Header toolbar / actions
+        # 1. Top Command Bar
         top_bar = QHBoxLayout()
-        self.btn_open = QPushButton("Open Song File...")
+        top_bar.setSpacing(10)
+
+        self.btn_open = QPushButton("📁 Open Song...")
         self.btn_open.setFixedHeight(34)
         self.btn_open.clicked.connect(self.on_open_file_clicked)
 
-        self.chk_sevenths = QCheckBox("Detect 7th Chords")
+        self.btn_demo = QPushButton("⚡ Demo Song")
+        self.btn_demo.setFixedHeight(34)
+        self.btn_demo.setToolTip("Analyze the built-in C-G-Am-F demo track")
+        self.btn_demo.clicked.connect(self.load_demo_song)
+
+        # Capo Selector
+        capo_lbl = QLabel("Capo:")
+        capo_lbl.setStyleSheet("color: #94a3b8; font-weight: bold;")
+        self.combo_capo = QComboBox()
+        self.combo_capo.setFixedHeight(32)
+        self.combo_capo.addItems(["No Capo"] + [f"Capo {i}" for i in range(1, 8)])
+        self.combo_capo.currentIndexChanged.connect(self.on_capo_changed)
+
+        # Transpose Buttons
+        trans_lbl = QLabel("Transpose:")
+        trans_lbl.setStyleSheet("color: #94a3b8; font-weight: bold;")
+        self.btn_trans_down = QPushButton("♭ -1")
+        self.btn_trans_down.setFixedWidth(44)
+        self.btn_trans_down.clicked.connect(lambda: self.adjust_transpose(-1))
+
+        self.lbl_trans_val = QLabel("0")
+        self.lbl_trans_val.setStyleSheet("font-weight: bold; color: #38bdf8; min-width: 18px;")
+        self.lbl_trans_val.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.btn_trans_up = QPushButton("♯ +1")
+        self.btn_trans_up.setFixedWidth(44)
+        self.btn_trans_up.clicked.connect(lambda: self.adjust_transpose(1))
+
+        self.chk_sevenths = QCheckBox("Detect 7ths")
         self.chk_sevenths.setToolTip("Include dominant 7th and minor 7th templates")
 
+        # Export Menu Button
         self.btn_export = QPushButton("Export Chords ▼")
         self.btn_export.setFixedHeight(34)
         export_menu = QMenu(self)
         export_menu.addAction("Export Plain Text (.txt)...", self.export_text_dialog)
         export_menu.addAction("Export ChordPro (.cho)...", self.export_chordpro_dialog)
-        export_menu.addAction("Export CSV (.csv)...", self.export_csv_dialog)
+        export_menu.addAction("Export CSV Spreadsheet (.csv)...", self.export_csv_dialog)
         export_menu.addSeparator()
-        export_menu.addAction("Save Sidecar Project (.chordscout.json)...", self.save_project_dialog)
-        export_menu.addAction("Load Sidecar Project...", self.load_project_dialog)
+        export_menu.addAction("Save Project Sidecar (.chordscout.json)...", self.save_project_dialog)
+        export_menu.addAction("Load Project Sidecar...", self.load_project_dialog)
         export_menu.addSeparator()
-        export_menu.addAction("Copy Chords to Clipboard", self.copy_to_clipboard)
+        export_menu.addAction("Copy Chords to Clipboard (Ctrl+C)", self.copy_to_clipboard)
         self.btn_export.setMenu(export_menu)
 
         top_bar.addWidget(self.btn_open)
+        top_bar.addWidget(self.btn_demo)
+        top_bar.addSpacing(8)
+        top_bar.addWidget(capo_lbl)
+        top_bar.addWidget(self.combo_capo)
+        top_bar.addSpacing(6)
+        top_bar.addWidget(trans_lbl)
+        top_bar.addWidget(self.btn_trans_down)
+        top_bar.addWidget(self.lbl_trans_val)
+        top_bar.addWidget(self.btn_trans_up)
+        top_bar.addSpacing(10)
         top_bar.addWidget(self.chk_sevenths)
         top_bar.addStretch()
         top_bar.addWidget(self.btn_export)
         main_layout.addLayout(top_bar)
 
-        # Drop Banner / Info Card
-        self.banner = QFrame()
-        self.banner.setFrameShape(QFrame.Shape.StyledPanel)
-        banner_layout = QHBoxLayout(self.banner)
-        self.lbl_file_info = QLabel("Drop an MP3, WAV, FLAC, or M4A file anywhere into this window.")
-        self.lbl_file_info.setStyleSheet("font-size: 14px; font-weight: bold; color: #70a0ff;")
-        self.lbl_meta_info = QLabel("")
-        self.lbl_meta_info.setStyleSheet("color: #aaaaaa; font-size: 12px;")
-        banner_layout.addWidget(self.lbl_file_info)
-        banner_layout.addStretch()
-        banner_layout.addWidget(self.lbl_meta_info)
-        main_layout.addWidget(self.banner)
-
-        # Progress bar (hidden until active)
+        # Progress bar (for analysis)
         self.progress_bar = QProgressBar()
         self.progress_bar.setFixedHeight(18)
         self.progress_bar.setVisible(False)
         main_layout.addWidget(self.progress_bar)
 
-        # Timeline Bar
-        self.timeline = ChordTimelineWidget(self)
-        self.timeline.seek_requested.connect(self.seek_audio)
-        main_layout.addWidget(self.timeline)
+        # Stacked central view: Index 0 = Hero Dropzone, Index 1 = Workspace Deck
+        self.stack = QStackedWidget()
 
-        # Middle splitter: Left = Chord Table, Right = Guitar Chord Diagram
+        # View 0: Hero Dropzone
+        self.drop_hero = DropOverlayWidget(self)
+        self.drop_hero.browse_requested.connect(self.on_open_file_clicked)
+        self.drop_hero.demo_requested.connect(self.load_demo_song)
+        self.stack.addWidget(self.drop_hero)
+
+        # View 1: Main Workspace Deck
+        self.workspace = QWidget()
+        w_layout = QVBoxLayout(self.workspace)
+        w_layout.setContentsMargins(0, 0, 0, 0)
+        w_layout.setSpacing(10)
+
+        # Waveform Timeline
+        self.timeline = WaveformTimelineWidget(self)
+        self.timeline.seek_requested.connect(self.seek_audio)
+        w_layout.addWidget(self.timeline)
+
+        # Middle Splitter: Tabs (Grid / Table / ChordPro) on Left, Fretboard on Right
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Left: Table of chord segments
+        # Left Container: Tabs
+        left_tabs = QTabWidget()
+
+        # Tab 1: Lead Sheet Grid View
+        self.grid_view = ChordGridView(self)
+        self.grid_view.segment_clicked.connect(self.on_grid_card_clicked)
+        left_tabs.addTab(self.grid_view, "🎼 Lead Sheet Grid")
+
+        # Tab 2: Table & Editor View
         table_container = QWidget()
         t_layout = QVBoxLayout(table_container)
-        t_layout.setContentsMargins(0, 0, 0, 0)
-        t_layout.setSpacing(6)
-
-        table_header = QHBoxLayout()
-        t_lbl = QLabel("Chord Progression (Time-Aligned)")
-        t_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #dddddd;")
-        self.lbl_current_badge = QLabel("Current: -")
-        self.lbl_current_badge.setStyleSheet(
-            "background-color: #334466; color: #ffffff; padding: 2px 8px; border-radius: 4px; font-weight: bold;"
-        )
-        table_header.addWidget(t_lbl)
-        table_header.addStretch()
-        table_header.addWidget(self.lbl_current_badge)
-        t_layout.addLayout(table_header)
+        t_layout.setContentsMargins(8, 8, 8, 8)
+        t_layout.setSpacing(8)
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Time Range", "Duration", "Chord", "Confidence"])
@@ -437,192 +290,75 @@ class ChordScoutApp(QMainWindow):
         self.table.itemDoubleClicked.connect(self.on_table_item_double_clicked)
         t_layout.addWidget(self.table)
 
-        # Table buttons: Split, Merge, Edit
-        edit_bar = QHBoxLayout()
-        self.btn_edit_chord = QPushButton("Change Chord")
-        self.btn_edit_chord.clicked.connect(self.edit_selected_chord)
-        self.btn_split = QPushButton("Split Segment")
-        self.btn_split.clicked.connect(self.split_selected_segment)
-        self.btn_merge = QPushButton("Merge with Next")
-        self.btn_merge.clicked.connect(self.merge_with_next_segment)
-        self.btn_delete = QPushButton("Set to Silence (N)")
-        self.btn_delete.clicked.connect(self.set_selected_to_silence)
+        # Edit Action Buttons
+        edit_row = QHBoxLayout()
+        btn_edit = QPushButton("✏️ Change Chord")
+        btn_edit.clicked.connect(self.edit_selected_chord)
+        btn_split = QPushButton("✂️ Split Midpoint")
+        btn_split.clicked.connect(self.split_selected_segment)
+        btn_merge = QPushButton("🔗 Merge Next")
+        btn_merge.clicked.connect(self.merge_with_next_segment)
+        btn_del = QPushButton("🗑️ Set Silence")
+        btn_del.clicked.connect(self.set_selected_to_silence)
 
-        edit_bar.addWidget(self.btn_edit_chord)
-        edit_bar.addWidget(self.btn_split)
-        edit_bar.addWidget(self.btn_merge)
-        edit_bar.addWidget(self.btn_delete)
-        t_layout.addLayout(edit_bar)
+        edit_row.addWidget(btn_edit)
+        edit_row.addWidget(btn_split)
+        edit_row.addWidget(btn_merge)
+        edit_row.addWidget(btn_del)
+        t_layout.addLayout(edit_row)
 
-        splitter.addWidget(table_container)
+        left_tabs.addTab(table_container, "📋 Detailed Table & Editor")
 
-        # Right: Guitar Fretboard Diagram Box
-        right_container = QWidget()
-        r_layout = QVBoxLayout(right_container)
-        r_layout.setContentsMargins(0, 0, 0, 0)
-        r_layout.setSpacing(6)
+        # Tab 3: ChordPro Text View
+        self.text_chordpro = QTextEdit()
+        self.text_chordpro.setReadOnly(True)
+        self.text_chordpro.setStyleSheet("font-family: monospace; font-size: 12px; background-color: #10141f;")
+        left_tabs.addTab(self.text_chordpro, "📄 ChordPro / Text View")
 
-        r_lbl = QLabel("Guitar Voicing (Standard Tuning)")
-        r_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #dddddd;")
-        r_layout.addWidget(r_lbl)
+        splitter.addWidget(left_tabs)
 
+        # Right Container: Rosewood Fretboard Panel
+        right_panel = QFrame()
+        right_panel.setObjectName("cardFrame")
+        r_layout = QVBoxLayout(right_panel)
+        r_layout.setContentsMargins(6, 6, 6, 6)
         self.guitar_widget = GuitarFretboardWidget(self)
         r_layout.addWidget(self.guitar_widget)
 
-        # Help / Hint box
-        hint_box = QFrame()
-        hint_box.setStyleSheet("background-color: #1a1a24; border-radius: 6px; padding: 6px;")
-        h_layout = QVBoxLayout(hint_box)
-        lbl_hint_title = QLabel("💡 ChordScout Tips:")
-        lbl_hint_title.setStyleSheet("font-weight: bold; color: #ffa726; font-size: 11px;")
-        lbl_hint_body = QLabel(
-            "• Chords reflect algorithmic analysis.\n"
-            "• Double-click any chord to adjust name.\n"
-            "• Click the timeline to seek playback.\n"
-            "• Export to ChordPro, Text, or CSV anytime."
-        )
-        lbl_hint_body.setStyleSheet("color: #a0a0b0; font-size: 11px;")
-        h_layout.addWidget(lbl_hint_title)
-        h_layout.addWidget(lbl_hint_body)
-        r_layout.addWidget(hint_box)
-        r_layout.addStretch()
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 68)
+        splitter.setStretchFactor(1, 32)
+        w_layout.addWidget(splitter, 1)
 
-        splitter.addWidget(right_container)
-        splitter.setStretchFactor(0, 65)
-        splitter.setStretchFactor(1, 35)
-        main_layout.addWidget(splitter)
+        # Bottom HUD & Transport Bar
+        self.hud = HudTransportWidget(self)
+        self.hud.play_toggled.connect(self.toggle_playback)
+        self.hud.prev_chord_requested.connect(self.jump_prev_chord)
+        self.hud.next_chord_requested.connect(self.jump_next_chord)
+        self.hud.speed_changed.connect(self.on_speed_changed)
+        self.hud.loop_toggled.connect(self.on_loop_toggled)
+        self.hud.volume_changed.connect(self.on_volume_changed)
+        w_layout.addWidget(self.hud)
 
-        # Audio Playback Control Bar
-        play_bar = QHBoxLayout()
-        self.btn_play = QPushButton("▶ Play")
-        self.btn_play.setFixedWidth(80)
-        self.btn_play.clicked.connect(self.toggle_playback)
+        self.stack.addWidget(self.workspace)
+        main_layout.addWidget(self.stack, 1)
 
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(0, 1000)
-        self.slider.sliderMoved.connect(self.on_slider_moved)
-
-        self.lbl_time = QLabel("00:00 / 00:00")
-        self.lbl_time.setFixedWidth(95)
-
-        play_bar.addWidget(self.btn_play)
-        play_bar.addWidget(self.slider)
-        play_bar.addWidget(self.lbl_time)
-        main_layout.addLayout(play_bar)
-
-        # Status bar
+        # Status Bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready. Drop an MP3 here to begin.")
+        self.status_bar.showMessage("Ready. Drop an audio file into the window to analyze.")
 
-    def _apply_dark_theme(self) -> None:
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #121218;
-            }
-            QWidget {
-                color: #e0e0ea;
-                font-family: 'Segoe UI', Arial, sans-serif;
-            }
-            QFrame {
-                background-color: #1c1c26;
-                border: 1px solid #2d2d3d;
-                border-radius: 8px;
-            }
-            QPushButton {
-                background-color: #2b2b3d;
-                border: 1px solid #404058;
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-weight: 500;
-                color: #ffffff;
-            }
-            QPushButton:hover {
-                background-color: #3d3d56;
-                border-color: #555577;
-            }
-            QPushButton:pressed {
-                background-color: #1e1e2d;
-            }
-            QTableWidget {
-                background-color: #181822;
-                gridline-color: #262636;
-                border: 1px solid #2d2d3d;
-                border-radius: 6px;
-                selection-background-color: #2a4365;
-                selection-color: #ffffff;
-            }
-            QHeaderView::section {
-                background-color: #20202e;
-                color: #b0b0c5;
-                padding: 5px;
-                border: none;
-                border-right: 1px solid #2d2d3d;
-                border-bottom: 1px solid #2d2d3d;
-                font-weight: bold;
-            }
-            QProgressBar {
-                background-color: #1c1c26;
-                border: 1px solid #333348;
-                border-radius: 4px;
-                text-align: center;
-                color: #ffffff;
-                font-size: 11px;
-            }
-            QProgressBar::chunk {
-                background-color: #3b82f6;
-                border-radius: 3px;
-            }
-            QSlider::groove:horizontal {
-                height: 6px;
-                background: #252535;
-                border-radius: 3px;
-            }
-            QSlider::sub-page:horizontal {
-                background: #3b82f6;
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #ffffff;
-                width: 14px;
-                margin-top: -4px;
-                margin-bottom: -4px;
-                border-radius: 7px;
-            }
-            QMenu {
-                background-color: #20202c;
-                border: 1px solid #3d3d52;
-                color: #ffffff;
-                padding: 4px;
-            }
-            QMenu::item {
-                padding: 6px 20px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background-color: #3b82f6;
-            }
-            QCheckBox {
-                color: #c0c0d5;
-            }
-        """)
-
-    # --- Drag and Drop Handling ---
+    # --- Drag & Drop ---
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
             if any(is_supported_audio_file(u.toLocalFile()) for u in urls):
                 event.acceptProposedAction()
-                self.banner.setStyleSheet("background-color: #223355; border: 2px dashed #4488ff;")
                 return
         event.ignore()
 
-    def dragLeaveEvent(self, event) -> None:  # noqa: N802
-        self.banner.setStyleSheet("")
-
     def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
-        self.banner.setStyleSheet("")
         urls = event.mimeData().urls()
         for u in urls:
             path = Path(u.toLocalFile())
@@ -632,30 +368,38 @@ class ChordScoutApp(QMainWindow):
                 return
         event.ignore()
 
-    # --- Analysis Pipeline ---
+    # --- Analysis Intake ---
 
     def on_open_file_clicked(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
+        path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select Song Audio File",
+            "Open Audio File",
             "",
             "Audio Files (*.mp3 *.wav *.flac *.ogg *.m4a *.aac);;All Files (*)",
         )
-        if file_path:
-            self.start_analysis(Path(file_path))
+        if path:
+            self.start_analysis(Path(path))
+
+    def load_demo_song(self) -> None:
+        demo_path = Path(__file__).resolve().parent.parent.parent / "demo" / "classic_pop_progression.mp3"
+        if demo_path.exists():
+            self.start_analysis(demo_path)
+        else:
+            QMessageBox.information(
+                self, "Demo Song", "Demo audio file not found. Please drop an MP3 into the window."
+            )
 
     def start_analysis(self, file_path: Path) -> None:
         self.player.stop()
-        self.lbl_file_info.setText(f"Analyzing: {file_path.name}")
-        self.lbl_meta_info.setText("Running chord recognition...")
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.btn_open.setEnabled(False)
+        self.btn_demo.setEnabled(False)
 
         # Set media source for playback
         self.player.setSource(QUrl.fromLocalFile(str(file_path.resolve())))
 
-        # Run in background thread
+        # Run background worker thread
         include_7ths = self.chk_sevenths.isChecked()
         self.audio_worker = AnalysisWorker(file_path, include_sevenths=include_7ths)
         self.audio_worker.progress_updated.connect(self.on_progress_updated)
@@ -665,44 +409,53 @@ class ChordScoutApp(QMainWindow):
 
     def on_progress_updated(self, progress: float, message: str) -> None:
         self.progress_bar.setValue(int(progress * 100))
-        self.progress_bar.setFormat(f"{int(progress * 100)}% - {message}")
+        self.progress_bar.setFormat(f"{int(progress * 100)}% — {message}")
         self.status_bar.showMessage(message)
 
-    def on_analysis_success(self, result: AnalysisResult, audio: object) -> None:
+    def on_analysis_success(self, result: AnalysisResult, audio: np.ndarray) -> None:
         self.btn_open.setEnabled(True)
+        self.btn_demo.setEnabled(True)
         self.progress_bar.setVisible(False)
+
         self.current_result = result
+        self.base_segments = [
+            ChordSegment(s.start_time, s.end_time, s.chord, s.confidence, s.is_user_edited)
+            for s in result.segments
+        ]
         self.audio_data = audio
+        self.transposition_semitones = 0
+        self.lbl_trans_val.setText("0")
+        self.combo_capo.setCurrentIndex(0)
 
+        # Switch stack to Workspace view
+        self.stack.setCurrentIndex(1)
+
+        # Update HUD
         meta = result.metadata
-        dur_str = format_timestamp(meta.duration)
-        key_str = f"Key: {meta.key_estimate}" if meta.key_estimate else ""
-        bpm_str = f"{int(meta.tempo_bpm)} BPM" if meta.tempo_bpm else ""
-        meta_summary = "  |  ".join(filter(bool, [dur_str, key_str, bpm_str]))
-        self.lbl_file_info.setText(meta.file_name)
-        self.lbl_meta_info.setText(meta_summary)
+        self.hud.update_metadata(meta.key_estimate, meta.tempo_bpm)
+        self.hud.update_timecode(0.0, meta.duration)
 
-        # Update Timeline & Table
-        self.timeline.set_data(result.segments, meta.duration)
+        # Update Timeline & Views
+        self.timeline.set_data(result.segments, meta.duration, audio_data=audio)
+        self.grid_view.set_segments(result.segments)
         self.populate_table()
+        self.update_chordpro_preview()
 
         self.status_bar.showMessage(
-            f"Detected {len(result.segments)} chord segments. Double-click to edit."
+            f"Analysis complete: {len(result.segments)} chords detected. Key: {meta.key_estimate or 'N/A'}"
         )
 
-        # Select first chord if exists
         if result.segments:
-            self.table.selectRow(0)
+            self.select_segment_index(0)
 
     def on_analysis_error(self, err_msg: str) -> None:
         self.btn_open.setEnabled(True)
+        self.btn_demo.setEnabled(True)
         self.progress_bar.setVisible(False)
-        self.lbl_file_info.setText("Analysis failed.")
-        self.lbl_meta_info.setText("")
-        QMessageBox.critical(self, "Analysis Error", f"Could not analyze file:\n\n{err_msg}")
-        self.status_bar.showMessage("Error during analysis.")
+        QMessageBox.critical(self, "Analysis Failed", f"Could not analyze audio file:\n\n{err_msg}")
+        self.status_bar.showMessage("Analysis failed.")
 
-    # --- Table & Timeline Display ---
+    # --- UI Updates ---
 
     def populate_table(self) -> None:
         if not self.current_result:
@@ -723,13 +476,12 @@ class ChordScoutApp(QMainWindow):
             # Chord
             c_label = seg.chord + (" *" if seg.is_user_edited else "")
             c_item = QTableWidgetItem(c_label)
-            font = QFont("Segoe UI", 11, QFont.Weight.Bold)
-            c_item.setFont(font)
+            c_item.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
             c_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             # Confidence
-            conf_percent = int(seg.confidence * 100) if seg.chord != "N" else 100
-            conf_item = QTableWidgetItem(f"{conf_percent}%")
+            conf_val = int(seg.confidence * 100) if seg.chord != "N" else 100
+            conf_item = QTableWidgetItem(f"{conf_val}%")
             conf_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             self.table.setItem(row, 0, t_item)
@@ -737,14 +489,36 @@ class ChordScoutApp(QMainWindow):
             self.table.setItem(row, 2, c_item)
             self.table.setItem(row, 3, conf_item)
 
+    def update_chordpro_preview(self) -> None:
+        if not self.current_result:
+            return
+        cho_text = export_chordpro(self.current_result)
+        self.text_chordpro.setPlainText(cho_text)
+
+    def select_segment_index(self, idx: int) -> None:
+        if not self.current_result or idx < 0 or idx >= len(self.current_result.segments):
+            return
+        seg = self.current_result.segments[idx]
+        capo = self.combo_capo.currentIndex()
+        self.guitar_widget.set_chord(seg.chord, capo_fret=capo)
+        self.grid_view.set_active_index(idx)
+
+        # Highlight in table without triggering circular signals
+        self.table.blockSignals(True)
+        self.table.selectRow(idx)
+        self.table.blockSignals(False)
+
     def on_table_selection_changed(self) -> None:
         row = self.table.currentRow()
-        if self.current_result and 0 <= row < len(self.current_result.segments):
-            seg = self.current_result.segments[row]
-            self.guitar_widget.set_chord(seg.chord)
+        if 0 <= row < len(self.current_result.segments):
+            self.select_segment_index(row)
 
     def on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
         self.edit_selected_chord()
+
+    def on_grid_card_clicked(self, idx: int, start_time: float) -> None:
+        self.seek_audio(start_time)
+        self.select_segment_index(idx)
 
     # --- Editing Chords ---
 
@@ -754,27 +528,28 @@ class ChordScoutApp(QMainWindow):
             return
 
         seg = self.current_result.segments[row]
-        common_chords = list(GUITAR_CHORDS.keys())
-        if "N" not in common_chords:
-            common_chords.insert(0, "N")
+        common = list(GUITAR_CHORDS.keys())
+        if "N" not in common:
+            common.insert(0, "N")
 
-        current_idx = common_chords.index(seg.chord) if seg.chord in common_chords else 0
+        cur_idx = common.index(seg.chord) if seg.chord in common else 0
 
         new_chord, ok = QInputDialog.getItem(
             self,
-            "Edit Chord",
-            f"Select or type new chord for [{seg.formatted_start} - {seg.formatted_end}]:",
-            common_chords,
-            current_idx,
+            "Edit Chord Name",
+            f"Select or enter chord for [{seg.formatted_start} - {seg.formatted_end}]:",
+            common,
+            cur_idx,
             editable=True,
         )
         if ok and new_chord:
             seg.chord = new_chord.strip()
             seg.is_user_edited = True
             self.populate_table()
-            self.table.selectRow(row)
+            self.grid_view.set_segments(self.current_result.segments)
             self.timeline.update()
-            self.guitar_widget.set_chord(seg.chord)
+            self.update_chordpro_preview()
+            self.select_segment_index(row)
 
     def split_selected_segment(self) -> None:
         row = self.table.currentRow()
@@ -782,18 +557,20 @@ class ChordScoutApp(QMainWindow):
             return
 
         seg = self.current_result.segments[row]
-        mid = (seg.start_time + seg.end_time) / 2.0
         if seg.duration < 0.6:
             QMessageBox.information(self, "Split", "Segment is too short to split further.")
             return
 
+        mid = (seg.start_time + seg.end_time) / 2.0
         seg1 = ChordSegment(seg.start_time, mid, seg.chord, seg.confidence, is_user_edited=True)
         seg2 = ChordSegment(mid, seg.end_time, seg.chord, seg.confidence, is_user_edited=True)
 
         self.current_result.segments[row:row + 1] = [seg1, seg2]
         self.populate_table()
-        self.table.selectRow(row)
-        self.timeline.set_data(self.current_result.segments, self.current_result.metadata.duration)
+        self.grid_view.set_segments(self.current_result.segments)
+        self.timeline.set_data(self.current_result.segments, self.current_result.metadata.duration, self.audio_data)
+        self.update_chordpro_preview()
+        self.select_segment_index(row)
 
     def merge_with_next_segment(self) -> None:
         row = self.table.currentRow()
@@ -807,8 +584,10 @@ class ChordScoutApp(QMainWindow):
 
         del self.current_result.segments[row + 1]
         self.populate_table()
-        self.table.selectRow(row)
-        self.timeline.set_data(self.current_result.segments, self.current_result.metadata.duration)
+        self.grid_view.set_segments(self.current_result.segments)
+        self.timeline.set_data(self.current_result.segments, self.current_result.metadata.duration, self.audio_data)
+        self.update_chordpro_preview()
+        self.select_segment_index(row)
 
     def set_selected_to_silence(self) -> None:
         row = self.table.currentRow()
@@ -818,9 +597,10 @@ class ChordScoutApp(QMainWindow):
         seg.chord = "N"
         seg.is_user_edited = True
         self.populate_table()
-        self.table.selectRow(row)
+        self.grid_view.set_segments(self.current_result.segments)
         self.timeline.update()
-        self.guitar_widget.set_chord("N")
+        self.update_chordpro_preview()
+        self.select_segment_index(row)
 
     def show_table_context_menu(self, pos) -> None:
         row = self.table.rowAt(pos.y())
@@ -829,12 +609,12 @@ class ChordScoutApp(QMainWindow):
         self.table.selectRow(row)
 
         menu = QMenu(self)
-        menu.addAction("Change Chord...", self.edit_selected_chord)
-        menu.addAction("Split Segment at Midpoint", self.split_selected_segment)
-        menu.addAction("Merge with Next Segment", self.merge_with_next_segment)
-        menu.addAction("Set to Silence (N)", self.set_selected_to_silence)
+        menu.addAction("✏️ Change Chord...", self.edit_selected_chord)
+        menu.addAction("✂️ Split Segment at Midpoint", self.split_selected_segment)
+        menu.addAction("🔗 Merge with Next Segment", self.merge_with_next_segment)
+        menu.addAction("🗑️ Set to Silence (N)", self.set_selected_to_silence)
         menu.addSeparator()
-        menu.addAction("Play from this Segment", lambda: self.play_from_row(row))
+        menu.addAction("▶ Play from this Segment", lambda: self.play_from_row(row))
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def play_from_row(self, row: int) -> None:
@@ -843,7 +623,36 @@ class ChordScoutApp(QMainWindow):
             self.seek_audio(seg.start_time)
             self.player.play()
 
-    # --- Audio Playback & Synchronization ---
+    # --- Transpose & Capo ---
+
+    def adjust_transpose(self, delta: int) -> None:
+        if not self.current_result:
+            return
+        self.transposition_semitones += delta
+        self.lbl_trans_val.setText(f"{self.transposition_semitones:+d}" if self.transposition_semitones != 0 else "0")
+
+        # Apply to segments
+        self.current_result.segments = transpose_segments(self.base_segments, self.transposition_semitones)
+        self.populate_table()
+        self.grid_view.set_segments(self.current_result.segments)
+        self.timeline.set_data(self.current_result.segments, self.current_result.metadata.duration, self.audio_data)
+        self.update_chordpro_preview()
+
+        # Update current chord
+        pos_sec = self.player.position() / 1000.0
+        seg = self.current_result.get_chord_at_time(pos_sec)
+        if seg:
+            self.guitar_widget.set_chord(seg.chord, self.combo_capo.currentIndex())
+
+    def on_capo_changed(self, idx: int) -> None:
+        # Capo 0 to 7
+        if self.current_result:
+            pos_sec = self.player.position() / 1000.0
+            seg = self.current_result.get_chord_at_time(pos_sec)
+            if seg:
+                self.guitar_widget.set_chord(seg.chord, capo_fret=idx)
+
+    # --- Playback & Synchronization ---
 
     def toggle_playback(self) -> None:
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -852,52 +661,102 @@ class ChordScoutApp(QMainWindow):
             self.player.play()
 
     def on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
-        if state == QMediaPlayer.PlaybackState.PlayingState:
-            self.btn_play.setText("⏸ Pause")
-        else:
-            self.btn_play.setText("▶ Play")
+        is_playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self.hud.set_playing_state(is_playing)
 
     def on_player_position_changed(self, pos_ms: int) -> None:
         pos_sec = pos_ms / 1000.0
-        dur_ms = self.player.duration()
-        dur_sec = dur_ms / 1000.0 if dur_ms > 0 else (self.current_result.metadata.duration if self.current_result else 1.0)
+        dur_sec = self.current_result.metadata.duration if self.current_result else 1.0
 
+        # Update Timeline playhead & HUD timecode
         self.timeline.set_current_time(pos_sec)
+        self.hud.update_timecode(pos_sec, dur_sec)
 
-        # Update slider without triggering move signal
-        if dur_sec > 0:
-            val = int((pos_sec / dur_sec) * 1000)
-            self.slider.blockSignals(True)
-            self.slider.setValue(val)
-            self.slider.blockSignals(False)
+        if not self.current_result or not self.current_result.segments:
+            return
 
-        # Time label
-        cur_str = format_timestamp(pos_sec)
-        tot_str = format_timestamp(dur_sec)
-        self.lbl_time.setText(f"{cur_str} / {tot_str}")
+        # Find current segment and upcoming segment
+        current_seg: Optional[ChordSegment] = None
+        current_idx: int = -1
+        for idx, s in enumerate(self.current_result.segments):
+            if s.start_time <= pos_sec < s.end_time:
+                current_seg = s
+                current_idx = idx
+                break
 
-        # Active chord update
-        if self.current_result:
-            seg = self.current_result.get_chord_at_time(pos_sec)
-            if seg:
-                self.lbl_current_badge.setText(f"Current: {seg.chord}")
-                self.guitar_widget.set_chord(seg.chord)
+        if current_seg:
+            next_seg = (
+                self.current_result.segments[current_idx + 1]
+                if current_idx + 1 < len(self.current_result.segments)
+                else None
+            )
+            countdown = max(0.0, current_seg.end_time - pos_sec)
+            next_name = next_seg.chord if next_seg else None
+            self.hud.update_active_chord(current_seg.chord, next_name, countdown)
 
-    def on_slider_moved(self, val: int) -> None:
-        dur_ms = self.player.duration()
-        if dur_ms > 0:
-            target_ms = int((val / 1000.0) * dur_ms)
-            self.player.setPosition(target_ms)
+            # Update fretboard and grid
+            capo = self.combo_capo.currentIndex()
+            self.guitar_widget.set_chord(current_seg.chord, capo_fret=capo)
+            self.grid_view.update_playback_time(pos_sec)
+
+            # Loop check
+            if self.is_looping_chord and pos_sec >= current_seg.end_time - 0.05:
+                self.seek_audio(current_seg.start_time)
 
     def seek_audio(self, target_sec: float) -> None:
         target_ms = int(target_sec * 1000)
         self.player.setPosition(target_ms)
+        self.timeline.set_current_time(target_sec)
+
+    def jump_prev_chord(self) -> None:
+        if not self.current_result or not self.current_result.segments:
+            return
+        pos_sec = self.player.position() / 1000.0
+        for idx in range(len(self.current_result.segments) - 1, -1, -1):
+            s = self.current_result.segments[idx]
+            if s.start_time < pos_sec - 0.3:
+                self.seek_audio(s.start_time)
+                self.select_segment_index(idx)
+                return
+        self.seek_audio(0.0)
+
+    def jump_next_chord(self) -> None:
+        if not self.current_result or not self.current_result.segments:
+            return
+        pos_sec = self.player.position() / 1000.0
+        for idx, s in enumerate(self.current_result.segments):
+            if s.start_time > pos_sec + 0.1:
+                self.seek_audio(s.start_time)
+                self.select_segment_index(idx)
+                return
+
+    def on_speed_changed(self, speed: float) -> None:
+        self.player.setPlaybackRate(speed)
+        self.status_bar.showMessage(f"Playback speed set to {speed}x")
+
+    def on_loop_toggled(self, loop_on: bool) -> None:
+        self.is_looping_chord = loop_on
+        if loop_on and self.current_result:
+            pos_sec = self.player.position() / 1000.0
+            seg = self.current_result.get_chord_at_time(pos_sec)
+            if seg:
+                self.timeline.set_loop_range(seg.start_time, seg.end_time, enabled=True)
+                self.status_bar.showMessage(f"Looping chord: {seg.chord}")
+                return
+        self.timeline.set_loop_range(None, None, enabled=False)
+        self.status_bar.showMessage("Loop disabled.")
+
+    def on_volume_changed(self, vol: float) -> None:
+        self.audio_output.setVolume(vol)
+
+    def strum_current_chord(self) -> None:
+        self.guitar_widget.on_strum_clicked()
 
     # --- Export Dialogs ---
 
     def check_has_result(self) -> bool:
         if not self.current_result or not self.current_result.segments:
-            QMessageBox.warning(self, "No Song", "Please drop or open an audio file first.")
+            QMessageBox.warning(self, "No Song", "Please load an audio file first.")
             return False
         return True
 
@@ -910,7 +769,7 @@ class ChordScoutApp(QMainWindow):
         if path:
             text = export_plain_text(self.current_result)
             Path(path).write_text(text, encoding="utf-8")
-            self.status_bar.showMessage(f"Saved text chart: {Path(path).name}")
+            self.status_bar.showMessage(f"Exported text chart: {Path(path).name}")
 
     def export_chordpro_dialog(self) -> None:
         if not self.check_has_result():
@@ -921,7 +780,7 @@ class ChordScoutApp(QMainWindow):
         if path:
             cho = export_chordpro(self.current_result)
             Path(path).write_text(cho, encoding="utf-8")
-            self.status_bar.showMessage(f"Saved ChordPro: {Path(path).name}")
+            self.status_bar.showMessage(f"Exported ChordPro: {Path(path).name}")
 
     def export_csv_dialog(self) -> None:
         if not self.check_has_result():
@@ -931,7 +790,7 @@ class ChordScoutApp(QMainWindow):
         )
         if path:
             export_csv(self.current_result, Path(path))
-            self.status_bar.showMessage(f"Saved CSV: {Path(path).name}")
+            self.status_bar.showMessage(f"Exported CSV: {Path(path).name}")
 
     def save_project_dialog(self) -> None:
         if not self.check_has_result():
@@ -956,17 +815,10 @@ class ChordScoutApp(QMainWindow):
         if path:
             try:
                 res = load_project(Path(path))
-                self.current_result = res
-                self.lbl_file_info.setText(res.metadata.file_name)
-                self.lbl_meta_info.setText(
-                    f"{format_timestamp(res.metadata.duration)} | Key: {res.metadata.key_estimate or 'N/A'}"
-                )
-                self.timeline.set_data(res.segments, res.metadata.duration)
-                self.populate_table()
-                # If audio file exists at original path, load it
+                self.on_analysis_success(res, audio=np.array([]))
                 if os.path.exists(res.metadata.file_path):
                     self.player.setSource(QUrl.fromLocalFile(res.metadata.file_path))
-                self.status_bar.showMessage(f"Loaded project: {Path(path).name}")
+                self.status_bar.showMessage(f"Project loaded: {Path(path).name}")
             except Exception as err:
                 QMessageBox.critical(self, "Load Error", f"Failed to load project:\n\n{err}")
 
@@ -974,13 +826,12 @@ class ChordScoutApp(QMainWindow):
         if not self.check_has_result():
             return
         text = export_plain_text(self.current_result)
-        clipboard = QApplication.clipboard()
-        clipboard.setText(text)
-        self.status_bar.showMessage("Chord chart copied to clipboard!")
+        QApplication.clipboard().setText(text)
+        self.status_bar.showMessage("Chord chart copied to clipboard! (Ctrl+C)")
 
 
 def main(initial_file: Optional[str] = None) -> None:
-    """Entrypoint for the ChordScout desktop GUI."""
+    """Launch the ChordScout application."""
     app = QApplication(sys.argv)
     window = ChordScoutApp(initial_file=initial_file)
     window.show()
