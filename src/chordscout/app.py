@@ -144,6 +144,16 @@ class ChordScoutApp(QMainWindow):
         self.setStyleSheet(STUDIO_DARK_STYLESHEET)
         self._setup_shortcuts()
 
+        # Window Icon
+        for candidate in [
+            Path(__file__).resolve().parent.parent.parent / "assets" / "chordscout.ico",
+            Path(sys.prefix) / "assets" / "chordscout.ico",
+            Path(sys.executable).parent / "assets" / "chordscout.ico",
+        ]:
+            if candidate.exists():
+                self.setWindowIcon(QIcon(str(candidate)))
+                break
+
         if initial_file and os.path.exists(initial_file):
             self.start_analysis(Path(initial_file))
 
