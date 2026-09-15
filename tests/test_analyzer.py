@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import chordscout.analyzer as analyzer
 from chordscout.analyzer import (
     analyze_chords,
     build_chord_templates,
@@ -79,6 +80,32 @@ def test_merge_absorbs_micro_glitches():
     assert len(merged) == 2
     assert merged[0].chord == "C"
     assert merged[1].chord == "G"
+
+
+def test_analyze_chords_preserves_offbeat_changes(monkeypatch: pytest.MonkeyPatch):
+    """Chord changes between detected beats must remain visible."""
+    sr = 22050
+    duration = 0.5
+    notes_by_chord = [
+        ("C", [261.63, 329.63, 392.00]),
+        ("G", [196.00, 246.94, 293.66]),
+        ("Am", [220.00, 261.63, 329.63]),
+        ("F", [174.61, 220.00, 261.63]),
+    ] * 2
+    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+    audio = np.concatenate(
+        [sum(np.sin(2 * np.pi * frequency * t) for frequency in notes) for _, notes in notes_by_chord]
+    ).astype(np.float32)
+    audio /= np.max(np.abs(audio)) + 1e-6
+    monkeypatch.setattr(
+        analyzer.librosa.beat,
+        "beat_track",
+        lambda **_: (120.0, np.array([0, 22, 44, 66, 80])),
+    )
+
+    segments, _ = analyze_chords(audio, sr=sr)
+
+    assert [name for name, _ in notes_by_chord] == [segment.chord for segment in segments]
 
 
 def test_analyze_chords_synthetic_progression(synthetic_progression_wav: Path):

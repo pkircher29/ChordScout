@@ -188,7 +188,7 @@ def analyze_chords(
     sr: int = 22050,
     hop_length: int = 1024,
     include_sevenths: bool = False,
-    min_segment_duration: float = 0.4,
+    min_segment_duration: float = 0.1,
     silence_threshold: float = 0.015,
     confidence_threshold: float = 0.35,
     progress_callback: Optional[Any] = None,
@@ -288,75 +288,37 @@ def analyze_chords(
 
     raw_segments: List[ChordSegment] = []
 
-    # If beats detected and valid, sync chroma to beats for musical coherence
-    has_beats = len(beats) > 3 and beats[-1] < chroma.shape[1]
-    if has_beats:
-        # Sync chroma and RMS to beats
-        synced_chroma = librosa.util.sync(chroma, beats, aggregate=np.median)
-        synced_rms = librosa.util.sync(rms.reshape(1, -1), beats, aggregate=np.median)[0]
-        beat_times = librosa.frames_to_time(beats, sr=sr, hop_length=hop_length)
+    # Beat tracking is useful for tempo metadata, but one label per beat interval
+    # loses genuine changes that happen on an offbeat. Label at frame resolution,
+    # then let the segment smoother remove only very brief noise.
+    smoothed_chroma = median_filter(chroma, size=(1, 3))
+    frame_times = librosa.frames_to_time(np.arange(min_len), sr=sr, hop_length=hop_length)
 
-        # Append duration end time
-        all_times = np.concatenate([[0.0], beat_times, [total_duration]])
-        all_times = np.unique(np.sort(all_times))
+    norms = np.linalg.norm(smoothed_chroma, axis=0, keepdims=True)
+    norms[norms < 1e-6] = 1.0
+    norm_chroma = smoothed_chroma / norms
 
-        num_intervals = min(synced_chroma.shape[1], len(all_times) - 1)
-        for idx in range(num_intervals):
-            t_start = float(all_times[idx])
-            t_end = float(all_times[idx + 1])
-            col = synced_chroma[:, idx]
-            energy = float(synced_rms[idx])
+    # (N_chords, 12) x (12, N_frames) -> (N_chords, N_frames)
+    all_scores = np.dot(template_matrix, norm_chroma)
+    best_indices = np.argmax(all_scores, axis=0)
 
-            if energy < silence_threshold:
-                raw_segments.append(ChordSegment(t_start, t_end, "N", confidence=1.0))
-                continue
+    dt = float(hop_length / sr)
+    for i in range(min_len):
+        t_start = float(frame_times[i])
+        t_end = float(min(total_duration, t_start + dt))
+        energy = float(rms[i])
 
-            col_norm = normalize_vector(col)
-            # Dot product with templates
-            scores = np.dot(template_matrix, col_norm)
-            best_idx = int(np.argmax(scores))
-            best_score = float(scores[best_idx])
+        if energy < silence_threshold:
+            raw_segments.append(ChordSegment(t_start, t_end, "N", confidence=1.0))
+            continue
 
-            if best_score < confidence_threshold:
-                chord_label = "N"
-                conf = 0.5
-            else:
-                chord_label = chord_names[best_idx]
-                conf = max(0.1, min(1.0, (best_score - 0.2) / 0.8))
-
-            raw_segments.append(ChordSegment(t_start, t_end, chord_label, confidence=conf))
-
-    else:
-        # Frame-based with 2D median filter smoothing
-        smoothed_chroma = median_filter(chroma, size=(1, 9))
-        frame_times = librosa.frames_to_time(np.arange(min_len), sr=sr, hop_length=hop_length)
-
-        # Normalize columns
-        norms = np.linalg.norm(smoothed_chroma, axis=0, keepdims=True)
-        norms[norms < 1e-6] = 1.0
-        norm_chroma = smoothed_chroma / norms
-
-        # Matrix multiplication: (N_chords, 12) x (12, N_frames) -> (N_chords, N_frames)
-        all_scores = np.dot(template_matrix, norm_chroma)
-        best_indices = np.argmax(all_scores, axis=0)
-
-        dt = float(hop_length / sr)
-        for i in range(min_len):
-            t_start = float(frame_times[i])
-            t_end = float(min(total_duration, t_start + dt))
-            energy = float(rms[i])
-
-            if energy < silence_threshold:
-                raw_segments.append(ChordSegment(t_start, t_end, "N", confidence=1.0))
-                continue
-
-            best_idx = int(best_indices[i])
-            score = float(all_scores[best_idx, i])
-            if score < confidence_threshold:
-                raw_segments.append(ChordSegment(t_start, t_end, "N", confidence=0.5))
-            else:
-                conf = max(0.1, min(1.0, (score - 0.2) / 0.8))
-                raw_segments.append(ChordSegment(t_start, t_end, chord_names[best_idx], confidence=conf))
+        best_idx = int(best_indices[i])
+        score = float(all_scores[best_idx, i])
+        if score < confidence_threshold:
+            raw_segments.append(ChordSegment(t_start, t_end, "N", confidence=0.5))
+        else:
+            conf = max(0.1, min(1.0, (score - 0.2) / 0.8))
+            raw_segments.append(ChordSegment(t_start, t_end, chord_names[best_idx], confidence=conf))
 
     if progress_callback:
         progress_callback(0.85, "Smoothing and merging chord segments...")
