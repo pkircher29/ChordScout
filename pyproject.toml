@@ -1,0 +1,18 @@
+[project]
+name = "chordscout"
+version = "0.1.0"
+description = "Local-first chord progression analysis for song files"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "librosa>=0.11,<0.12",
+  "numpy>=2,<3",
+  "soundfile>=0.13,<0.14",
+  "PySide6>=6.8,<7",
+]
+
+[project.scripts]
+chordscout = "chordscout.cli:run_cli"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
