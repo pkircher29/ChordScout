@@ -9,6 +9,7 @@ from chordscout.analyzer import (
     analyze_chords,
     build_chord_templates,
     estimate_key,
+    hold_chord_labels,
     merge_and_smooth_segments,
 )
 from chordscout.audio import load_audio
@@ -80,6 +81,63 @@ def test_merge_absorbs_micro_glitches():
     assert len(merged) == 2
     assert merged[0].chord == "C"
     assert merged[1].chord == "G"
+
+
+def test_hold_chord_labels_ignores_near_tie_flicker():
+    """A rival that leads by less than change_margin must not split the chord."""
+    # Row 0 is G, row 1 is Gm. Gm pokes ahead by 0.02 in the middle.
+    scores = np.array(
+        [
+            [0.80, 0.80, 0.80, 0.79, 0.79, 0.80],
+            [0.70, 0.70, 0.70, 0.81, 0.81, 0.70],
+        ],
+        dtype=np.float32,
+    )
+    rms = np.ones(scores.shape[1], dtype=np.float32)
+    labels = [name for name, _ in hold_chord_labels(scores, ["G", "Gm"], rms, change_margin=0.05)]
+    assert labels == ["G", "G", "G", "G", "G", "G"]
+
+
+def test_hold_chord_labels_accepts_a_real_change_and_resets_on_silence():
+    scores = np.array(
+        [
+            [0.85, 0.40, 0.20, 0.20],
+            [0.40, 0.85, 0.10, 0.82],
+        ],
+        dtype=np.float32,
+    )
+    rms = np.array([0.2, 0.2, 0.001, 0.2], dtype=np.float32)
+    labels = [name for name, _ in hold_chord_labels(scores, ["C", "G"], rms, change_margin=0.05)]
+    assert labels == ["C", "G", "N", "G"]
+
+
+def test_analyze_chords_stable_power_chord_does_not_flicker():
+    """A chord with no third used to flip G/Gm. It should stay on one label."""
+    sr = 22050
+    duration = 3.0
+    freqs = [98.00, 146.83, 196.00, 293.66]  # G power chord
+    n = int(sr * duration)
+    t = np.arange(n) / sr
+    rng = np.random.default_rng(2)
+    signal = np.zeros(n, dtype=np.float64)
+    for index, freq in enumerate(freqs):
+        start = int(sr * 0.02 * index / (len(freqs) - 1))
+        tt = t[start:]
+        for harmonic in range(1, 7):
+            signal[start:] += (
+                (1.0 / harmonic)
+                * np.sin(2 * np.pi * freq * harmonic * (1 + 0.001 * harmonic) * tt)
+                * np.exp(-tt * 0.9 * (0.5 + 0.4 * harmonic))
+            )
+    signal[: int(sr * 0.015)] += rng.standard_normal(int(sr * 0.015)) * 0.08
+    signal = (signal / (np.max(np.abs(signal)) + 1e-6)).astype(np.float32)
+
+    segments, _ = analyze_chords(signal, sr=sr)
+    chord_names = [segment.chord for segment in segments if segment.chord != "N"]
+
+    assert chord_names
+    assert len(set(chord_names)) == 1
+    assert chord_names[0] in {"G", "Gm"}
 
 
 def test_analyze_chords_preserves_offbeat_changes(monkeypatch: pytest.MonkeyPatch):

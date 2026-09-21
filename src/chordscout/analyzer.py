@@ -113,6 +113,72 @@ def estimate_key(chroma_mean: np.ndarray) -> str:
     return best_key
 
 
+def _confidence_from_score(score: float) -> float:
+    """Map a cosine match in roughly [0.2, 1.0] onto a 0.1-1.0 confidence."""
+    return max(0.1, min(1.0, (score - 0.2) / 0.8))
+
+
+def hold_chord_labels(
+    scores: np.ndarray,
+    chord_names: List[str],
+    rms: np.ndarray,
+    silence_threshold: float = 0.015,
+    confidence_threshold: float = 0.35,
+    change_margin: float = 0.05,
+) -> List[Tuple[str, float]]:
+    """Choose one label per frame, and do not change chords on a near-tie.
+
+    ``scores`` is cosine similarity with shape ``(n_chords, n_frames)``.
+
+    Desktop chroma (CQT) separates pitch classes sharply, so two templates that
+    share most notes (G vs Gm on a power chord, or any other ambiguous frame)
+    trade the top score by only about 0.00-0.02 and each spell lasts long enough
+    to survive a short segment hold. A real triad change still leads the chord
+    it replaces by well over 0.10. Require that lead (``change_margin``) before
+    replacing the held chord.
+
+    The held chord only blocks a challenger while it is itself still above
+    ``confidence_threshold``. Once it drops out, the next frame that clears the
+    floor can start a new chord immediately. Silence also clears the hold.
+    """
+    if scores.ndim != 2:
+        raise ValueError("scores must have shape (n_chords, n_frames)")
+    n_frames = int(scores.shape[1])
+    if len(rms) < n_frames:
+        raise ValueError("rms must cover every score frame")
+    if len(chord_names) != scores.shape[0]:
+        raise ValueError("chord_names must match the score rows")
+
+    labels: List[Tuple[str, float]] = []
+    held: Optional[int] = None
+
+    for i in range(n_frames):
+        if float(rms[i]) < silence_threshold:
+            labels.append(("N", 1.0))
+            held = None
+            continue
+
+        best = int(np.argmax(scores[:, i]))
+        best_score = float(scores[best, i])
+        if best_score < confidence_threshold:
+            labels.append(("N", 0.5))
+            held = None
+            continue
+
+        held_score = float(scores[held, i]) if held is not None else -1.0
+        if (
+            held is None
+            or best == held
+            or held_score < confidence_threshold
+            or best_score >= held_score + change_margin
+        ):
+            held = best
+
+        labels.append((chord_names[held], _confidence_from_score(float(scores[held, i]))))
+
+    return labels
+
+
 def merge_and_smooth_segments(
     raw_segments: List[ChordSegment],
     total_duration: float,
@@ -191,6 +257,8 @@ def analyze_chords(
     min_segment_duration: float = 0.1,
     silence_threshold: float = 0.015,
     confidence_threshold: float = 0.35,
+    change_margin: float = 0.05,
+    chroma_smooth_frames: int = 3,
     progress_callback: Optional[Any] = None,
 ) -> Tuple[List[ChordSegment], Dict[str, Any]]:
     """Analyze audio to extract time-aligned chord segments and metadata.
@@ -201,8 +269,15 @@ def analyze_chords(
         hop_length: Hop length for STFT/CQT (default 1024).
         include_sevenths: Whether to include 7th chord templates.
         min_segment_duration: Minimum duration (seconds) before micro-segments are merged.
+            Kept near a tenth of a second so real offbeat changes survive. Raising
+            this toward half a second is what makes detection miss fast changes;
+            false flips are handled by ``change_margin`` instead.
         silence_threshold: RMS threshold below which frames are labeled 'N'.
-        confidence_threshold: Minimum correlation required, else 'N'.
+        confidence_threshold: Minimum correlation required to start or keep a chord, else 'N'.
+        change_margin: How far a new template must outscore the held chord before
+            the label changes. 0 restores raw frame-by-frame argmax.
+        chroma_smooth_frames: Width of the chroma median filter, in frames. 3 is
+            about 140 ms at the default hop and only removes single-frame spikes.
         progress_callback: Callable taking float progress (0.0 to 1.0) and status string.
 
     Returns:
@@ -262,7 +337,7 @@ def analyze_chords(
     if progress_callback:
         progress_callback(0.50, "Tracking beat rhythm...")
 
-    # Beat tracking to synchronize chords with musical beats
+    # Tempo only. Chord labels are not snapped to these beats; see below.
     try:
         tempo, beats = librosa.beat.beat_track(
             y=y_perc, sr=sr, hop_length=hop_length, trim=False
@@ -288,10 +363,11 @@ def analyze_chords(
 
     raw_segments: List[ChordSegment] = []
 
-    # Beat tracking is useful for tempo metadata, but one label per beat interval
-    # loses genuine changes that happen on an offbeat. Label at frame resolution,
-    # then let the segment smoother remove only very brief noise.
-    smoothed_chroma = median_filter(chroma, size=(1, 3))
+    # Beat tracking stays in the metadata only. One label per beat interval drops
+    # genuine offbeat changes, so chords are labeled per frame. A wide median
+    # would blur those changes too; near-tie flicker is rejected by change_margin.
+    smooth_frames = max(1, int(chroma_smooth_frames))
+    smoothed_chroma = median_filter(chroma, size=(1, smooth_frames))
     frame_times = librosa.frames_to_time(np.arange(min_len), sr=sr, hop_length=hop_length)
 
     norms = np.linalg.norm(smoothed_chroma, axis=0, keepdims=True)
@@ -300,25 +376,21 @@ def analyze_chords(
 
     # (N_chords, 12) x (12, N_frames) -> (N_chords, N_frames)
     all_scores = np.dot(template_matrix, norm_chroma)
-    best_indices = np.argmax(all_scores, axis=0)
+
+    frame_labels = hold_chord_labels(
+        all_scores,
+        chord_names,
+        rms,
+        silence_threshold=silence_threshold,
+        confidence_threshold=confidence_threshold,
+        change_margin=change_margin,
+    )
 
     dt = float(hop_length / sr)
-    for i in range(min_len):
+    for i, (chord_label, conf) in enumerate(frame_labels):
         t_start = float(frame_times[i])
         t_end = float(min(total_duration, t_start + dt))
-        energy = float(rms[i])
-
-        if energy < silence_threshold:
-            raw_segments.append(ChordSegment(t_start, t_end, "N", confidence=1.0))
-            continue
-
-        best_idx = int(best_indices[i])
-        score = float(all_scores[best_idx, i])
-        if score < confidence_threshold:
-            raw_segments.append(ChordSegment(t_start, t_end, "N", confidence=0.5))
-        else:
-            conf = max(0.1, min(1.0, (score - 0.2) / 0.8))
-            raw_segments.append(ChordSegment(t_start, t_end, chord_names[best_idx], confidence=conf))
+        raw_segments.append(ChordSegment(t_start, t_end, chord_label, confidence=conf))
 
     if progress_callback:
         progress_callback(0.85, "Smoothing and merging chord segments...")
