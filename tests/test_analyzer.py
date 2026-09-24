@@ -128,3 +128,69 @@ def test_analyze_chords_synthetic_progression(synthetic_progression_wav: Path):
     # Check metadata
     assert abs(meta["duration"] - 8.0) < 0.1
     assert "key_estimate" in meta
+
+
+def _sine_chords(chords, seconds, sr=22050):
+    t = np.linspace(0, seconds, int(sr * seconds), endpoint=False)
+    audio = np.concatenate(
+        [sum(np.sin(2 * np.pi * frequency * t) for frequency in notes) for notes in chords]
+    ).astype(np.float32)
+    return audio / (np.max(np.abs(audio)) + 1e-6)
+
+
+C_MAJ = [261.63, 329.63, 392.00]
+G_MAJ = [196.00, 246.94, 293.66]
+A_MIN = [220.00, 261.63, 329.63]
+F_MAJ = [174.61, 220.00, 261.63]
+
+
+def test_quick_changes_survive_the_switch_penalty():
+    """0.4 s chords ending Am -> F (two shared notes) must all be kept."""
+    audio = _sine_chords([C_MAJ, G_MAJ, A_MIN, F_MAJ], 0.4)
+    segments, _ = analyze_chords(audio)
+    assert [s.chord for s in segments] == ["C", "G", "Am", "F"]
+
+
+def test_short_burst_does_not_create_a_change():
+    """A 60 ms wrong chord inside a held chord is noise, not a change."""
+    sr = 22050
+    audio = _sine_chords([C_MAJ], 2.0)
+    burst = _sine_chords([G_MAJ], 0.06)
+    audio[sr : sr + len(burst)] = burst
+    segments, _ = analyze_chords(audio)
+    assert [s.chord for s in segments if s.chord != "N"] == ["C"]
+
+
+def test_key_comes_from_the_decoded_chords():
+    audio = _sine_chords([C_MAJ, G_MAJ, A_MIN, F_MAJ], 1.0)
+    _, meta = analyze_chords(audio)
+    assert meta["key_estimate"] == "C major"
+
+
+def test_key_from_chords_picks_relative_minor_when_vi_outlasts_i():
+    names = list(build_chord_templates().keys())
+
+    def frames(*pairs):
+        return np.array([names.index(chord) for chord, count in pairs for _ in range(count)])
+
+    assert analyzer.key_from_chords(frames(("C", 40), ("F", 20), ("G", 20), ("Am", 10)), names) == (0, False)
+    assert analyzer.key_from_chords(frames(("Am", 50), ("Dm", 20), ("G", 15), ("C", 10)), names) == (0, True)
+    # D major with an out-of-key Cm blip.
+    assert analyzer.key_from_chords(frames(("D", 40), ("G", 30), ("A", 20), ("Bm", 30), ("Cm", 5)), names) == (2, False)
+    assert analyzer.key_from_chords(frames(("C", 10)), names) is None
+
+
+def test_diatonic_chords():
+    for chord in ["C", "Dm", "Em", "F", "G", "Am", "G7", "Am7"]:
+        assert analyzer.is_diatonic(chord, 0), chord
+    for chord in ["Cm", "D", "E", "Fm", "A#", "Bm", "C#"]:
+        assert not analyzer.is_diatonic(chord, 0), chord
+
+
+def test_viterbi_ignores_near_tie_flicker_but_keeps_a_sustained_change():
+    # Two states trading a 0.02 lead every frame, then state 1 clearly ahead.
+    flicker = np.array([[0.52, 0.50] if i % 2 else [0.50, 0.52] for i in range(40)]).T
+    change = np.tile([[0.3], [0.6]], (1, 20))
+    path = analyzer.viterbi(np.hstack([flicker, change]), np.ones(60), penalty=0.9)
+    assert len(set(path[:40])) == 1
+    assert set(path[45:]) == {1}

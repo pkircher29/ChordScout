@@ -13,8 +13,10 @@ ChordScout is a standalone Windows desktop application and CLI tool where you ca
   - Harmonic-Percussive Separation (HPSS) to strip out drum noise and isolate harmonic chord tones.
   - Constant-Q Transform (CQT) chromagram tuned to standard concert pitch ($C_2 = 65.4\text{ Hz}$).
   - Automatic tuning offset estimation ($\pm \text{cents}$) for songs tuned slightly sharp or flat.
-  - Beat-tracking rhythm synchronization to snap chord changes to musical beats.
-  - Key estimation (e.g. C major, G major, A minor).
+  - Chord templates scored by centered (Pearson) correlation and decoded with Viterbi over the whole track. Each chord change costs a fixed penalty, so sustained changes land where the evidence flips while near-ties, passing tones and strum noise never add up to a change.
+  - Two passes: the first pass's chords give the song's key (e.g. C major, B minor), and the second gives in-key chords a small head start so thin passages stop guessing out-of-key chords.
+  - Thin, near-tie passages count less toward a change, so they stop flickering while clearly played quick changes still switch at the normal cost.
+  - Beat tracking for tempo metadata.
 - **Guitar Chord Diagrams**:
   - Interactive visual fretboard widget displaying finger positions (1=Index, 2=Middle, 3=Ring, 4=Pinky), fret wires, open (`o`) and muted (`x`) strings in standard tuning ($E-A-D-G-B-e$).
 - **Synchronized Playback**:
