@@ -303,6 +303,7 @@ def analyze_chords(
     switch_penalty: float = SWITCH_PENALTY,
     key_bonus: float = KEY_BONUS,
     clarity_power: float = CLARITY_POWER,
+    chroma_smooth_frames: int = 3,
     progress_callback: Optional[Any] = None,
 ) -> Tuple[List[ChordSegment], Dict[str, Any]]:
     """Analyze audio to extract time-aligned chord segments and metadata.
@@ -318,6 +319,8 @@ def analyze_chords(
         switch_penalty: Cost of a chord change in the Viterbi decode.
         key_bonus: Head start for in-key chords on the second decode (0 skips it).
         clarity_power: How much less thin, near-tie frames count (0 disables).
+        chroma_smooth_frames: Width of the chroma median filter, in frames. 3 is
+            about 140 ms at the default hop and only removes single-frame spikes.
         progress_callback: Callable taking float progress (0.0 to 1.0) and status string.
 
     Returns:
@@ -406,7 +409,7 @@ def analyze_chords(
     # Beat tracking is useful for tempo metadata, but one label per beat interval
     # loses genuine changes that happen on an offbeat. Label at frame resolution,
     # then let the segment smoother remove only very brief noise.
-    smoothed_chroma = median_filter(chroma, size=(1, 3))
+    smoothed_chroma = median_filter(chroma, size=(1, max(1, int(chroma_smooth_frames))))
     frame_times = librosa.frames_to_time(np.arange(min_len), sr=sr, hop_length=hop_length)
 
     # (N_chords, 12) x (12, N_frames) -> (N_chords, N_frames)

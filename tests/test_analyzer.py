@@ -82,6 +82,35 @@ def test_merge_absorbs_micro_glitches():
     assert merged[1].chord == "G"
 
 
+def test_analyze_chords_stable_power_chord_does_not_flicker():
+    """A chord with no third used to flip G/Gm. It should stay on one label."""
+    sr = 22050
+    duration = 3.0
+    freqs = [98.00, 146.83, 196.00, 293.66]  # G power chord
+    n = int(sr * duration)
+    t = np.arange(n) / sr
+    rng = np.random.default_rng(2)
+    signal = np.zeros(n, dtype=np.float64)
+    for index, freq in enumerate(freqs):
+        start = int(sr * 0.02 * index / (len(freqs) - 1))
+        tt = t[start:]
+        for harmonic in range(1, 7):
+            signal[start:] += (
+                (1.0 / harmonic)
+                * np.sin(2 * np.pi * freq * harmonic * (1 + 0.001 * harmonic) * tt)
+                * np.exp(-tt * 0.9 * (0.5 + 0.4 * harmonic))
+            )
+    signal[: int(sr * 0.015)] += rng.standard_normal(int(sr * 0.015)) * 0.08
+    signal = (signal / (np.max(np.abs(signal)) + 1e-6)).astype(np.float32)
+
+    segments, _ = analyze_chords(signal, sr=sr)
+    chord_names = [segment.chord for segment in segments if segment.chord != "N"]
+
+    assert chord_names
+    assert len(set(chord_names)) == 1
+    assert chord_names[0] in {"G", "Gm"}
+
+
 def test_analyze_chords_preserves_offbeat_changes(monkeypatch: pytest.MonkeyPatch):
     """Chord changes between detected beats must remain visible."""
     sr = 22050
