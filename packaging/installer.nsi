@@ -52,7 +52,7 @@ Section "ChordScout Core" SecCore
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ChordScout" "UninstallString" '"$INSTDIR\Uninstall.exe"'
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ChordScout" "DisplayIcon" '"$INSTDIR\ChordScout.exe"'
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ChordScout" "Publisher" "pkircher29"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ChordScout" "DisplayVersion" "0.1.0"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ChordScout" "DisplayVersion" "0.2.0"
 
     ; Shortcuts
     CreateDirectory "$SMPROGRAMS\ChordScout"

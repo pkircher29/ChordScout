@@ -32,6 +32,27 @@ MINOR_KEY_PROFILE = np.array(
 )
 
 
+# Chords are decoded over the whole track (Viterbi), not frame by frame.
+# A chord change costs SWITCH_PENALTY in frame-score units; a new chord is
+# kept only when its lead, summed over every frame it lasts, pays that off.
+# Real changes win frame after frame; near-ties and passing tones never add up.
+SWITCH_PENALTY = 1.5
+
+# Head start for chords in the song's key on the second decode. The key comes
+# from the first decode's chords, not raw chroma. Clearly played chords win by
+# far more than this; in thin passages it keeps near-ties in key.
+KEY_BONUS = 0.05
+
+# A frame's evidence counts (best score / CLEAR_SCORE) ** CLARITY_POWER, capped
+# at 1: thin near-tie passages need longer to change and stop flickering, while
+# clearly played quick changes switch at the normal cost.
+CLARITY_POWER = 2.0
+CLEAR_SCORE = 0.5
+
+# Below this centered-correlation score a frame is "N" (no chord).
+CONFIDENCE_THRESHOLD = 0.25
+
+
 def normalize_vector(v: np.ndarray) -> np.ndarray:
     """Normalize vector to unit L2 norm."""
     norm = np.linalg.norm(v)
@@ -113,70 +134,92 @@ def estimate_key(chroma_mean: np.ndarray) -> str:
     return best_key
 
 
-def _confidence_from_score(score: float) -> float:
-    """Map a cosine match in roughly [0.2, 1.0] onto a 0.1-1.0 confidence."""
-    return max(0.1, min(1.0, (score - 0.2) / 0.8))
+def _centered(m: np.ndarray, axis: int) -> np.ndarray:
+    """Mean-removed, unit-length along ``axis`` (Pearson correlation form).
 
-
-def hold_chord_labels(
-    scores: np.ndarray,
-    chord_names: List[str],
-    rms: np.ndarray,
-    silence_threshold: float = 0.015,
-    confidence_threshold: float = 0.35,
-    change_margin: float = 0.05,
-) -> List[Tuple[str, float]]:
-    """Choose one label per frame, and do not change chords on a near-tie.
-
-    ``scores`` is cosine similarity with shape ``(n_chords, n_frames)``.
-
-    Desktop chroma (CQT) separates pitch classes sharply, so two templates that
-    share most notes (G vs Gm on a power chord, or any other ambiguous frame)
-    trade the top score by only about 0.00-0.02 and each spell lasts long enough
-    to survive a short segment hold. A real triad change still leads the chord
-    it replaces by well over 0.10. Require that lead (``change_margin``) before
-    replacing the held chord.
-
-    The held chord only blocks a challenger while it is itself still above
-    ``confidence_threshold``. Once it drops out, the next frame that clears the
-    floor can start a new chord immediately. Silence also clears the hold.
+    Log-compressed chroma has a floor in every bin, so plain cosine scores a
+    clean C triad nearly the same as Cm. Centering scores the shape instead.
     """
-    if scores.ndim != 2:
-        raise ValueError("scores must have shape (n_chords, n_frames)")
-    n_frames = int(scores.shape[1])
-    if len(rms) < n_frames:
-        raise ValueError("rms must cover every score frame")
-    if len(chord_names) != scores.shape[0]:
-        raise ValueError("chord_names must match the score rows")
+    c = m - np.mean(m, axis=axis, keepdims=True)
+    norms = np.linalg.norm(c, axis=axis, keepdims=True)
+    norms[norms < 1e-6] = 1.0
+    return c / norms
 
-    labels: List[Tuple[str, float]] = []
-    held: Optional[int] = None
 
-    for i in range(n_frames):
-        if float(rms[i]) < silence_threshold:
-            labels.append(("N", 1.0))
-            held = None
-            continue
+def _parse_chord(name: str) -> Optional[Tuple[int, bool]]:
+    """Root pitch class and minor flag of a chord name ("F#m7" -> (6, True))."""
+    root_name = name[:2] if len(name) > 1 and name[1] == "#" else name[:1]
+    if root_name not in PITCH_NAMES:
+        return None
+    return PITCH_NAMES.index(root_name), name[len(root_name):].startswith("m")
 
-        best = int(np.argmax(scores[:, i]))
-        best_score = float(scores[best, i])
-        if best_score < confidence_threshold:
-            labels.append(("N", 0.5))
-            held = None
-            continue
 
-        held_score = float(scores[held, i]) if held is not None else -1.0
-        if (
-            held is None
-            or best == held
-            or held_score < confidence_threshold
-            or best_score >= held_score + change_margin
-        ):
-            held = best
+def is_diatonic(chord: str, tonic: int) -> bool:
+    """True if ``chord`` is I, IV, V (major) or ii, iii, vi (minor) of ``tonic`` major."""
+    parsed = _parse_chord(chord)
+    if parsed is None:
+        return False
+    root, minor = parsed
+    degree = (root - tonic) % 12
+    return degree in (2, 4, 9) if minor else degree in (0, 5, 7)
 
-        labels.append((chord_names[held], _confidence_from_score(float(scores[held, i]))))
 
-    return labels
+def key_from_chords(path: np.ndarray, chord_names: List[str]) -> Optional[Tuple[int, bool]]:
+    """Major-key tonic whose diatonic chords cover the most decoded frames,
+
+    and whether the song sits on its relative minor (vi clearly outlasts I).
+    ``path`` holds chord indices; values past the chord list mean "N".
+    Returns None when fewer than ~2 seconds of chords were found.
+    """
+    path = np.asarray(path)
+    counts = np.bincount(path[path < len(chord_names)], minlength=len(chord_names))
+    if counts.sum() < 43:
+        return None
+
+    def frames_of(name: str) -> int:
+        return int(counts[chord_names.index(name)]) if name in chord_names else 0
+
+    best_tonic, best_cover = 0, -1
+    for tonic in range(12):
+        cover = sum(int(counts[c]) for c, name in enumerate(chord_names) if is_diatonic(name, tonic))
+        # Keys a fifth apart share four chords; a tie goes to the key whose
+        # I or vi chord is actually heard more.
+        cover = cover * 4 + frames_of(PITCH_NAMES[tonic]) + frames_of(f"{PITCH_NAMES[(tonic + 9) % 12]}m")
+        if cover > best_cover:
+            best_tonic, best_cover = tonic, cover
+    major = frames_of(PITCH_NAMES[best_tonic])
+    rel_minor = frames_of(f"{PITCH_NAMES[(best_tonic + 9) % 12]}m")
+    # Only the name depends on this; a near-even split is usually a major
+    # song visiting vi.
+    return best_tonic, rel_minor * 4 > major * 5
+
+
+def _key_name(tonic: int, minor: bool) -> str:
+    return f"{PITCH_NAMES[(tonic + 9) % 12]} minor" if minor else f"{PITCH_NAMES[tonic]} major"
+
+
+def viterbi(scores: np.ndarray, weights: np.ndarray, penalty: float) -> np.ndarray:
+    """Highest-scoring state path when every change costs ``penalty``.
+
+    ``scores`` is (states, frames). Staying is free and all changes cost the
+    same, so each step only needs the best previous state: O(frames x states).
+    """
+    n_states, n_frames = scores.shape
+    back = np.zeros((n_frames, n_states), dtype=np.int32)
+    total = scores[:, 0] * weights[0]
+    states = np.arange(n_states)
+    for t in range(1, n_frames):
+        best_prev = int(np.argmax(total))
+        switch_total = total[best_prev] - penalty
+        stay = total >= switch_total
+        back[t] = np.where(stay, states, best_prev)
+        total = np.where(stay, total, switch_total) + weights[t] * scores[:, t]
+    path = np.empty(n_frames, dtype=np.int32)
+    state = int(np.argmax(total))
+    for t in range(n_frames - 1, -1, -1):
+        path[t] = state
+        state = back[t, state]
+    return path
 
 
 def merge_and_smooth_segments(
@@ -256,8 +299,10 @@ def analyze_chords(
     include_sevenths: bool = False,
     min_segment_duration: float = 0.1,
     silence_threshold: float = 0.015,
-    confidence_threshold: float = 0.35,
-    change_margin: float = 0.05,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    switch_penalty: float = SWITCH_PENALTY,
+    key_bonus: float = KEY_BONUS,
+    clarity_power: float = CLARITY_POWER,
     chroma_smooth_frames: int = 3,
     progress_callback: Optional[Any] = None,
 ) -> Tuple[List[ChordSegment], Dict[str, Any]]:
@@ -269,13 +314,11 @@ def analyze_chords(
         hop_length: Hop length for STFT/CQT (default 1024).
         include_sevenths: Whether to include 7th chord templates.
         min_segment_duration: Minimum duration (seconds) before micro-segments are merged.
-            Kept near a tenth of a second so real offbeat changes survive. Raising
-            this toward half a second is what makes detection miss fast changes;
-            false flips are handled by ``change_margin`` instead.
         silence_threshold: RMS threshold below which frames are labeled 'N'.
-        confidence_threshold: Minimum correlation required to start or keep a chord, else 'N'.
-        change_margin: How far a new template must outscore the held chord before
-            the label changes. 0 restores raw frame-by-frame argmax.
+        confidence_threshold: Minimum centered correlation required, else 'N'.
+        switch_penalty: Cost of a chord change in the Viterbi decode.
+        key_bonus: Head start for in-key chords on the second decode (0 skips it).
+        clarity_power: How much less thin, near-tie frames count (0 disables).
         chroma_smooth_frames: Width of the chroma median filter, in frames. 3 is
             about 140 ms at the default hop and only removes single-frame spikes.
         progress_callback: Callable taking float progress (0.0 to 1.0) and status string.
@@ -337,7 +380,7 @@ def analyze_chords(
     if progress_callback:
         progress_callback(0.50, "Tracking beat rhythm...")
 
-    # Tempo only. Chord labels are not snapped to these beats; see below.
+    # Beat tracking to synchronize chords with musical beats
     try:
         tempo, beats = librosa.beat.beat_track(
             y=y_perc, sr=sr, hop_length=hop_length, trim=False
@@ -363,34 +406,50 @@ def analyze_chords(
 
     raw_segments: List[ChordSegment] = []
 
-    # Beat tracking stays in the metadata only. One label per beat interval drops
-    # genuine offbeat changes, so chords are labeled per frame. A wide median
-    # would blur those changes too; near-tie flicker is rejected by change_margin.
-    smooth_frames = max(1, int(chroma_smooth_frames))
-    smoothed_chroma = median_filter(chroma, size=(1, smooth_frames))
+    # Beat tracking is useful for tempo metadata, but one label per beat interval
+    # loses genuine changes that happen on an offbeat. Label at frame resolution,
+    # then let the segment smoother remove only very brief noise.
+    smoothed_chroma = median_filter(chroma, size=(1, max(1, int(chroma_smooth_frames))))
     frame_times = librosa.frames_to_time(np.arange(min_len), sr=sr, hop_length=hop_length)
 
-    norms = np.linalg.norm(smoothed_chroma, axis=0, keepdims=True)
-    norms[norms < 1e-6] = 1.0
-    norm_chroma = smoothed_chroma / norms
-
     # (N_chords, 12) x (12, N_frames) -> (N_chords, N_frames)
-    all_scores = np.dot(template_matrix, norm_chroma)
+    chord_scores = np.dot(_centered(template_matrix, axis=1), _centered(smoothed_chroma, axis=0))
+    n_chords = len(chord_names)
+    silent = rms < silence_threshold
 
-    frame_labels = hold_chord_labels(
-        all_scores,
-        chord_names,
-        rms,
-        silence_threshold=silence_threshold,
-        confidence_threshold=confidence_threshold,
-        change_margin=change_margin,
-    )
+    # Chords plus "N" (last row). N scores the confidence threshold, so it
+    # wins where no chord clears it, and owns silent frames outright.
+    scores = np.vstack([chord_scores, np.full((1, min_len), confidence_threshold)])
+    scores[:, silent] = -1.0
+    scores[n_chords, silent] = 1.0
+    best = np.max(chord_scores, axis=0)
+    weights = np.minimum(1.0, np.maximum(best, 0.0) / CLEAR_SCORE) ** clarity_power
+    weights[silent] = 1.0
+
+    path = viterbi(scores, weights, switch_penalty)
+
+    # Second pass: find the key the first pass's chords live in, give those
+    # chords a head start, and decode again.
+    song_key = key_from_chords(path, chord_names)
+    if song_key is not None and key_bonus > 0:
+        in_key = np.array([is_diatonic(name, song_key[0]) for name in chord_names])
+        boosted = scores.copy()
+        boosted[np.ix_(np.flatnonzero(in_key), np.flatnonzero(~silent))] += key_bonus
+        path = viterbi(boosted, weights, switch_penalty)
+    if song_key is not None:
+        estimated_key = _key_name(*song_key)
 
     dt = float(hop_length / sr)
-    for i, (chord_label, conf) in enumerate(frame_labels):
+    for i in range(min_len):
         t_start = float(frame_times[i])
         t_end = float(min(total_duration, t_start + dt))
-        raw_segments.append(ChordSegment(t_start, t_end, chord_label, confidence=conf))
+        state = int(path[i])
+        if state == n_chords:
+            raw_segments.append(ChordSegment(t_start, t_end, "N", confidence=1.0))
+        else:
+            # Centered scores run lower than cosine: a clean triad is ~0.55.
+            conf = max(0.1, min(1.0, (float(chord_scores[state, i]) - 0.2) / 0.5))
+            raw_segments.append(ChordSegment(t_start, t_end, chord_names[state], confidence=conf))
 
     if progress_callback:
         progress_callback(0.85, "Smoothing and merging chord segments...")
